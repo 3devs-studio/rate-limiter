@@ -1,0 +1,37 @@
+# Rate limiter configuration. ${VAR} and ${VAR:-default} are expanded.
+listen: ":8080"
+
+redis:
+  addr: "${REDIS_ADDR:-localhost:6379}"
+  password: "${REDIS_PASSWORD:-}"
+  db: 0
+
+upstreams:
+  # One entry per third-party API. Services call
+  #   ANY /v1/proxy/thirdparty/<path>   with header X-Service: <name>
+  thirdparty:
+    base_url: "${THIRDPARTY_URL:-http://localhost:9000}"
+
+    # The third party allows 100 requests/second. A token bucket admits at
+    # most burst + rate*T requests in any T seconds, so to never trip a
+    # 100-per-second window keep rate + burst <= 100.
+    rate: 90
+    burst: 10
+
+    # Weights decide each service's guaranteed share of rate and burst.
+    # Unused share is lent to busier services automatically.
+    services:
+      m1: { weight: 4 }   # 36 r/s guaranteed
+      m2: { weight: 3 }   # 27 r/s guaranteed
+      m3: { weight: 3 }   # 27 r/s guaranteed
+
+    max_queue_depth: 10000   # per service; callers get 503 beyond this
+    request_ttl: 60s         # queued longer than this -> 504 to the caller
+    result_ttl: 5m           # how long a finished response can be polled
+    concurrency: 32          # in-flight upstream calls per limiter instance
+    max_attempts: 5          # upstream 429s tolerated per request
+    default_cooldown: 1s     # used when a 429 has no Retry-After
+    remaining_header: "X-RateLimit-Remaining"   # optional quota header to sync from
+    default_wait: 30s        # proxy calls wait this long for a queued answer, then 202
+    timeout: 15s
+    max_body_bytes: 4194304

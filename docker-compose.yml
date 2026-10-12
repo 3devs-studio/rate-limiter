@@ -1,0 +1,24 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  fake-upstream:
+    build: .
+    entrypoint: ["fake-upstream", "-limit", "100", "-window", "1s"]
+    ports: ["9000:9000"]
+
+  ratelimiter:
+    build: .
+    environment:
+      REDIS_ADDR: redis:6379
+      THIRDPARTY_URL: http://fake-upstream:9000
+    ports: ["8080:8080"]
+    depends_on: [redis, fake-upstream]
+
+  # Run on demand: docker compose run --rm loadgen
+  loadgen:
+    build: .
+    entrypoint: ["loadgen", "-limiter", "http://ratelimiter:8080", "-upstream-stats", "http://fake-upstream:9000/stats"]
+    depends_on: [ratelimiter]
+    profiles: ["demo"]
