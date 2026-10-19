@@ -11,10 +11,10 @@ import (
 	"strconv"
 	"time"
 
-	"ratelimiter/internal/engine"
-	"ratelimiter/internal/forwarder"
-	"ratelimiter/internal/limiter"
-	"ratelimiter/internal/store"
+	"github.com/3devs-studio/rate-limiter/internal/engine"
+	"github.com/3devs-studio/rate-limiter/internal/forwarder"
+	"github.com/3devs-studio/rate-limiter/internal/limiter"
+	"github.com/3devs-studio/rate-limiter/internal/store"
 )
 
 // Server routes HTTP calls to upstream engines.
@@ -32,6 +32,7 @@ func New(ups map[string]*engine.Upstream, st *store.Store, log *slog.Logger) *Se
 	s.mux.HandleFunc("GET /v1/requests/{id}", s.getRequest)
 	s.mux.HandleFunc("POST /v1/acquire/{upstream}", s.acquire)
 	s.mux.HandleFunc("POST /v1/upstreams/{upstream}/cooldown", s.cooldown)
+	s.mux.HandleFunc("POST /v1/upstreams/{upstream}/reset", s.reset)
 	s.mux.HandleFunc("GET /v1/upstreams/{upstream}/stats", s.stats)
 	s.mux.HandleFunc("GET /v1/upstreams", s.listUpstreams)
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
@@ -186,9 +187,12 @@ func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
 type acquireBody struct {
 	Service string  `json:"service"`
 	Cost    float64 `json:"cost"`
+	Wait    string  `json:"wait"` // e.g. "5s": hold the call until a token is free
 }
 
 // acquire hands out a token to a service that calls the upstream itself.
+// With "wait" the call blocks until a token is granted or the wait elapses,
+// which lets a caller share the limiter's queue without proxying through it.
 func (s *Server) acquire(w http.ResponseWriter, r *http.Request) {
 	up, ok := s.upstream(w, r)
 	if !ok {
@@ -205,12 +209,24 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request) {
 	if in.Cost <= 0 {
 		in.Cost = 1
 	}
-	d, err := up.Acquire(r.Context(), in.Service, in.Cost)
+	var wait time.Duration
+	if in.Wait != "" {
+		d, err := time.ParseDuration(in.Wait)
+		if err != nil || d < 0 {
+			writeJSON(w, 400, map[string]string{"error": "wait must be a duration like 5s"})
+			return
+		}
+		wait = d
+	}
+	d, waited, err := up.AcquireWait(r.Context(), in.Service, in.Cost, wait)
 	if errors.Is(err, limiter.ErrUnknownService) {
 		writeJSON(w, 403, map[string]string{"error": err.Error()})
 		return
 	}
 	if err != nil {
+		if r.Context().Err() != nil {
+			return // caller went away while waiting
+		}
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
@@ -220,6 +236,7 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request) {
 		"retry_after_ms": d.RetryAfter.Milliseconds(),
 		"global_tokens":  d.GlobalTokens,
 		"service_tokens": d.ServiceTokens,
+		"waited_ms":      waited.Milliseconds(),
 	}
 	if d.Allowed {
 		writeJSON(w, 200, out)
@@ -244,6 +261,19 @@ func (s *Server) cooldown(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "cooling down"})
+}
+
+// reset refills every bucket of the upstream. Meant for demos and tests.
+func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
+	up, ok := s.upstream(w, r)
+	if !ok {
+		return
+	}
+	if err := up.Reset(r.Context()); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "reset"})
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {

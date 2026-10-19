@@ -90,9 +90,10 @@ All proxy calls need `X-Service: <name>`; the name must be configured.
 |---|---|
 | `ANY /v1/proxy/{upstream}/{path}` | Forwards the request to `base_url + path` (method, headers, query and body preserved). Returns the upstream's response. If it had to queue, waits up to `X-Wait` (default `default_wait`), then answers `202` with an id to poll. |
 | `GET /v1/requests/{id}` | The stored upstream response for a queued request, or `202` while still queued, `404` once expired. |
-| `POST /v1/acquire/{upstream}` `{"service":"m1","cost":1}` | For services that call the third party themselves: `200 {"allowed":true}` or `429` with `Retry-After` and `retry_after_ms`. |
+| `POST /v1/acquire/{upstream}` `{"service":"m1","cost":1,"wait":"5s"}` | For services that call the third party themselves: `200 {"allowed":true,"mode":"own"}` or `429` with `Retry-After` and `retry_after_ms`. With `wait`, the call is held until a token is free or the wait elapses, so a caller gets the queue without proxying its request body. |
+| `POST /v1/upstreams/{upstream}/reset` | Refills every bucket. For demos and tests. |
 | `POST /v1/upstreams/{upstream}/cooldown` `{"retry_after_ms":1000}` | A service that got a 429 directly tells everyone to back off. |
-| `GET /v1/upstreams/{upstream}/stats` | Token levels, cooldown, queue depth per service. |
+| `GET /v1/upstreams/{upstream}/stats` | Token levels, cooldown, queue depth and blocking acquires waiting, per service. |
 | `GET /healthz` | Liveness. |
 
 Optional proxy headers: `X-Cost` (tokens this call is worth, default 1),
@@ -113,7 +114,7 @@ curl -H 'X-Service: m1' -H 'X-Wait: 5s' http://localhost:8080/v1/proxy/thirdpart
 
 ## Configuration
 
-See [config.example.yaml](config.example.yaml) and the full design in [docs/DESIGN.md](docs/DESIGN.md). `${VAR}` and `${VAR:-default}`
+See [config.example.yaml](config.example.yaml), the full design in [docs/DESIGN.md](docs/DESIGN.md), and per-language snippets in [docs/INTEGRATION.md](docs/INTEGRATION.md). `${VAR}` and `${VAR:-default}`
 are expanded from the environment.
 
 ## Layout
@@ -126,6 +127,14 @@ are expanded from the environment.
 - `internal/server` HTTP API
 - `examples/fake-upstream` a strict third-party API stand-in
 - `examples/loadgen` simulates several services
+
+## SDKs
+
+Applications can also skip the HTTP hop and run the same Lua against Redis
+through a package: Go, TypeScript, Python, Rust, Ruby, PHP, Java and Kotlin
+SDKs live in [sdk/](sdk/README.md), with one middleware each and a shared
+conformance suite. The service publishes each upstream's shares to Redis at
+startup (`-publish` publishes and exits), which is what the SDKs read.
 
 ## Running more than one limiter instance
 

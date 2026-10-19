@@ -14,12 +14,13 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"ratelimiter/internal/config"
-	"ratelimiter/internal/forwarder"
-	"ratelimiter/internal/limiter"
-	"ratelimiter/internal/store"
+	"github.com/3devs-studio/rate-limiter/internal/config"
+	"github.com/3devs-studio/rate-limiter/internal/forwarder"
+	"github.com/3devs-studio/rate-limiter/internal/limiter"
+	"github.com/3devs-studio/rate-limiter/internal/store"
 )
 
 var (
@@ -39,6 +40,9 @@ type Upstream struct {
 	fw   *forwarder.Forwarder
 	log  *slog.Logger
 	cb   *http.Client
+
+	// waiting counts blocking Acquire calls per service on this instance.
+	waiting sync.Map // service -> *atomic.Int64
 }
 
 // New builds the engine for cfg.
@@ -280,6 +284,45 @@ func (u *Upstream) Acquire(ctx context.Context, service string, cost float64) (l
 	return u.lim.Acquire(ctx, u.spec, service, cost)
 }
 
+// AcquireWait is Acquire that keeps trying until a token is granted or wait
+// has elapsed. It is how a service borrows the limiter's queue without
+// proxying its request body through it.
+func (u *Upstream) AcquireWait(ctx context.Context, service string, cost float64, wait time.Duration) (limiter.Decision, time.Duration, error) {
+	start := time.Now()
+	d, err := u.lim.Acquire(ctx, u.spec, service, cost)
+	if err != nil || d.Allowed || wait <= 0 {
+		return d, time.Since(start), err
+	}
+	g := u.waitGauge(service)
+	g.Add(1)
+	defer g.Add(-1)
+	deadline := start.Add(wait)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return d, time.Since(start), nil
+		}
+		sleep(ctx, clamp(d.RetryAfter, 5*time.Millisecond, min(remaining, time.Second)))
+		if ctx.Err() != nil {
+			return d, time.Since(start), ctx.Err()
+		}
+		d, err = u.lim.Acquire(ctx, u.spec, service, cost)
+		if err != nil || d.Allowed {
+			return d, time.Since(start), err
+		}
+	}
+}
+
+func (u *Upstream) waitGauge(service string) *atomic.Int64 {
+	v, _ := u.waiting.LoadOrStore(service, new(atomic.Int64))
+	return v.(*atomic.Int64)
+}
+
+// Reset clears the upstream's buckets and cooldown so every service starts full.
+func (u *Upstream) Reset(ctx context.Context) error {
+	return u.lim.Reset(ctx, u.spec)
+}
+
 // ReportRateLimited lets a service that got a 429 directly share the cooldown.
 func (u *Upstream) ReportRateLimited(ctx context.Context, retryAfter time.Duration) error {
 	if retryAfter <= 0 {
@@ -293,6 +336,7 @@ type ServiceStats struct {
 	limiter.BucketState
 	Weight     float64 `json:"weight"`
 	QueueDepth int64   `json:"queue_depth"`
+	Waiting    int64   `json:"waiting"` // blocking acquires held on this instance
 }
 
 // Stats is the live view of an upstream.
@@ -315,7 +359,12 @@ func (u *Upstream) Stats(ctx context.Context) (Stats, error) {
 		if err != nil {
 			return st, err
 		}
-		st.Services = append(st.Services, ServiceStats{BucketState: s, Weight: u.cfg.Services[s.Name].Weight, QueueDepth: depth})
+		st.Services = append(st.Services, ServiceStats{
+			BucketState: s,
+			Weight:      u.cfg.Services[s.Name].Weight,
+			QueueDepth:  depth,
+			Waiting:     u.waitGauge(s.Name).Load(),
+		})
 	}
 	return st, nil
 }

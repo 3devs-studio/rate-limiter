@@ -1,0 +1,79 @@
+-- acquire.lua: two-tier token bucket (global + per-service) with fair borrowing.
+--
+-- KEYS[1]   global bucket hash        {tokens, ts}
+-- KEYS[2]   this service's bucket hash
+-- KEYS[3..] other services' bucket hashes
+--
+-- ARGV[1]   cost (tokens requested)
+-- ARGV[2]   global rate (tokens/sec)   ARGV[3] global burst
+-- ARGV[4]   service rate               ARGV[5] service burst
+-- ARGV[6..] (rate, burst) pairs for KEYS[3..]
+--
+-- Returns {allowed(0|1), retry_after_ms, mode, global_tokens, service_tokens}
+-- Numbers are returned as strings because Redis truncates Lua floats to integers.
+
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+
+local cost = tonumber(ARGV[1])
+local g_rate, g_burst = tonumber(ARGV[2]), tonumber(ARGV[3])
+local s_rate, s_burst = tonumber(ARGV[4]), tonumber(ARGV[5])
+
+local function current(key, rate, burst)
+  local v = redis.call('HMGET', key, 'tokens', 'ts')
+  if not v[1] then return burst end
+  local elapsed = now - tonumber(v[2])
+  if elapsed < 0 then elapsed = 0 end
+  return math.min(burst, tonumber(v[1]) + elapsed * rate)
+end
+
+local function save(key, tokens, rate, burst)
+  if tokens < 0 then tokens = 0 end
+  redis.call('HSET', key, 'tokens', tostring(tokens), 'ts', tostring(now))
+  -- The key may expire once it would be full again anyway.
+  redis.call('EXPIRE', key, math.ceil(burst / rate) + 60)
+end
+
+-- A cooldown is stored as an absolute time on the global bucket so it does
+-- not depend on key expiry.
+local cd = redis.call('HGET', KEYS[1], 'cd_until')
+if cd and tonumber(cd) > now then
+  local ms = math.ceil((tonumber(cd) - now) * 1000)
+  return {0, math.max(ms, 1), 'cooldown', tostring(current(KEYS[1], g_rate, g_burst)), tostring(current(KEYS[2], s_rate, s_burst))}
+end
+
+local g = current(KEYS[1], g_rate, g_burst)
+local s = current(KEYS[2], s_rate, s_burst)
+
+-- 1. The third party's overall limit is the hard ceiling.
+if g < cost then
+  local retry = math.ceil((cost - g) / g_rate * 1000)
+  return {0, math.max(retry, 1), 'global', tostring(g), tostring(s)}
+end
+
+-- 2. Within the service's own guaranteed share: take from both buckets.
+if s >= cost then
+  save(KEYS[1], g - cost, g_rate, g_burst)
+  save(KEYS[2], s - cost, s_rate, s_burst)
+  return {1, 0, 'own', tostring(g - cost), tostring(s - cost)}
+end
+
+-- 3. Over its share: borrow from the global pool, but only what the other
+--    services could not claim right now (their unused reserve stays untouched).
+local reserved = 0
+local i, a = 3, 6
+while KEYS[i] do
+  reserved = reserved + current(KEYS[i], tonumber(ARGV[a]), tonumber(ARGV[a + 1]))
+  i, a = i + 1, a + 2
+end
+
+if g - cost >= reserved then
+  save(KEYS[1], g - cost, g_rate, g_burst)
+  save(KEYS[2], s, s_rate, s_burst)
+  return {1, 0, 'borrow', tostring(g - cost), tostring(s)}
+end
+
+local retry_s = math.ceil((cost - s) / s_rate * 1000)
+local retry_g = math.ceil((reserved + cost - g) / g_rate * 1000)
+local retry = math.min(retry_s, math.max(retry_g, 1))
+return {0, math.max(retry, 1), 'share', tostring(g), tostring(s)}

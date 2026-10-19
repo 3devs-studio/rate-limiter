@@ -14,15 +14,16 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"ratelimiter/internal/config"
-	"ratelimiter/internal/engine"
-	"ratelimiter/internal/limiter"
-	"ratelimiter/internal/server"
-	"ratelimiter/internal/store"
+	"github.com/3devs-studio/rate-limiter/internal/config"
+	"github.com/3devs-studio/rate-limiter/internal/engine"
+	"github.com/3devs-studio/rate-limiter/internal/limiter"
+	"github.com/3devs-studio/rate-limiter/internal/server"
+	"github.com/3devs-studio/rate-limiter/internal/store"
 )
 
 func main() {
 	cfgPath := flag.String("config", "config.yaml", "path to config file")
+	publishOnly := flag.Bool("publish", false, "publish the upstreams' shares to Redis for SDKs and exit")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -41,12 +42,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	lim := limiter.New(rdb)
+	// SDKs (sdk/*) read the resolved shares from Redis instead of the YAML.
+	for name, ucfg := range cfg.Upstreams {
+		weights := make(map[string]float64, len(ucfg.Services))
+		for s, svc := range ucfg.Services {
+			weights[s] = svc.Weight
+		}
+		if err := lim.Publish(ctx, ucfg.LimiterSpec(), weights, "ratelimiter"); err != nil {
+			log.Error("publish config", "upstream", name, "err", err)
+			os.Exit(1)
+		}
+		log.Info("published config", "upstream", name, "key", limiter.ConfigKey(name))
+	}
+	if *publishOnly {
+		return
+	}
+
 	st := store.New(rdb)
 	if err := st.Start(ctx); err != nil {
 		log.Error("store", "err", err)
 		os.Exit(1)
 	}
-	lim := limiter.New(rdb)
 
 	ups := make(map[string]*engine.Upstream, len(cfg.Upstreams))
 	for name, ucfg := range cfg.Upstreams {

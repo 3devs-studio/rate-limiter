@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,11 +17,11 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 
-	"ratelimiter/internal/config"
-	"ratelimiter/internal/engine"
-	"ratelimiter/internal/limiter"
-	"ratelimiter/internal/server"
-	"ratelimiter/internal/store"
+	"github.com/3devs-studio/rate-limiter/internal/config"
+	"github.com/3devs-studio/rate-limiter/internal/engine"
+	"github.com/3devs-studio/rate-limiter/internal/limiter"
+	"github.com/3devs-studio/rate-limiter/internal/server"
+	"github.com/3devs-studio/rate-limiter/internal/store"
 )
 
 // strictUpstream rejects anything beyond limit requests per sliding window,
@@ -288,5 +289,46 @@ func TestValidationAndAcquireAPI(t *testing.T) {
 	b, _ := io.ReadAll(st.Body)
 	if !strings.Contains(string(b), `"cooldown_remaining_ms"`) || !strings.Contains(string(b), `"queue_depth"`) {
 		t.Fatalf("stats body: %s", b)
+	}
+}
+
+func TestBlockingAcquireAndReset(t *testing.T) {
+	up := &strictUpstream{limit: 100, window: time.Second}
+	h := newHarness(t, baseYAML, up) // rate 20/s, burst 5; m1 share 10/s, burst 2.5
+
+	post := func(body string) (*http.Response, map[string]interface{}) {
+		resp, err := http.Post(h.srv.URL+"/v1/acquire/api", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]interface{}
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		return resp, out
+	}
+	// Spend m1's burst, then a blocking acquire must wait for the refill
+	// (about 100 ms at 10 tokens/s) instead of failing.
+	post(`{"service":"m1"}`)
+	post(`{"service":"m1"}`)
+	resp, out := post(`{"service":"m1","wait":"2s"}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("blocking acquire: %d %v", resp.StatusCode, out)
+	}
+	if waited, _ := out["waited_ms"].(float64); waited < 20 {
+		t.Fatalf("expected the call to wait for a refill, waited %v ms", waited)
+	}
+	// Too short a wait: 429 with the time to retry.
+	resp, out = post(`{"service":"m1","wait":"1ms"}`)
+	if resp.StatusCode != 429 || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("short wait: %d %v", resp.StatusCode, out)
+	}
+	// Reset refills everything.
+	r, err := http.Post(h.srv.URL+"/v1/upstreams/api/reset", "application/json", nil)
+	if err != nil || r.StatusCode != 200 {
+		t.Fatalf("reset: %v %d", err, r.StatusCode)
+	}
+	resp, out = post(`{"service":"m1"}`)
+	if resp.StatusCode != 200 || out["mode"] != "own" {
+		t.Fatalf("after reset: %d %v", resp.StatusCode, out)
 	}
 }

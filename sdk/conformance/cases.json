@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "about": "Language-neutral behaviour tests. Every SDK runs these against a real Redis: publish the spec under upstream `conformance-<name>`, reset, then execute the steps in order. Rates are deliberately tiny so refills during a test are negligible.",
+  "tolerance": 0.1,
+  "tolerance_note": "service_tokens and global_tokens expectations match within this absolute tolerance, since a few milliseconds of refill happen between steps on a real Redis.",
+  "steps_schema": {
+    "acquire": "{service, cost?, wait_ms?, expect: {allowed, mode?, min_waited_ms?, min_retry_after_ms?, max_retry_after_ms?, service_tokens?, global_tokens?}}",
+    "drain": "acquire cost 1 for service until refused or max (default 1000); {expect_count, expect_last_mode?}",
+    "acquire_error": "acquire must fail with an unknown-service error; {service}",
+    "cooldown": "{ms}", "sync": "{remaining}", "sleep": "{ms}", "reset": "{}"
+  },
+  "cases": [
+    {
+      "name": "burst-is-split-by-share",
+      "spec": {"rate": 1, "burst": 100, "services": {"m1": {"rate": 0.4, "burst": 40}, "m2": {"rate": 0.3, "burst": 30}, "m3": {"rate": 0.3, "burst": 30}}},
+      "steps": [
+        {"op": "acquire", "service": "m1", "expect": {"allowed": true, "mode": "own", "service_tokens": 39, "global_tokens": 99}},
+        {"op": "drain", "service": "m1", "expect_count": 39, "expect_last_mode": "share"},
+        {"op": "drain", "service": "m2", "expect_count": 30, "expect_last_mode": "share"},
+        {"op": "drain", "service": "m3", "expect_count": 30, "expect_last_mode": "global"},
+        {"op": "acquire", "service": "m1", "expect": {"allowed": false, "mode": "global", "min_retry_after_ms": 1}}
+      ]
+    },
+    {
+      "name": "borrowing-leaves-others-reserve",
+      "spec": {"rate": 1, "burst": 100, "services": {"m1": {"rate": 0.5, "burst": 20}, "m2": {"rate": 0.25, "burst": 10}, "m3": {"rate": 0.25, "burst": 10}}},
+      "steps": [
+        {"op": "drain", "service": "m1", "max": 20, "expect_count": 20, "expect_last_mode": "own"},
+        {"op": "acquire", "service": "m1", "expect": {"allowed": true, "mode": "borrow", "global_tokens": 79}},
+        {"op": "drain", "service": "m1", "expect_count": 59, "expect_last_mode": "share"},
+        {"op": "drain", "service": "m2", "expect_count": 10, "expect_last_mode": "share"},
+        {"op": "drain", "service": "m3", "expect_count": 10, "expect_last_mode": "global"}
+      ]
+    },
+    {
+      "name": "cost",
+      "spec": {"rate": 1, "burst": 10, "services": {"m1": {"rate": 1, "burst": 10}}},
+      "steps": [
+        {"op": "acquire", "service": "m1", "cost": 4, "expect": {"allowed": true, "mode": "own", "service_tokens": 6, "global_tokens": 6}},
+        {"op": "acquire", "service": "m1", "cost": 7, "expect": {"allowed": false, "mode": "global"}},
+        {"op": "acquire", "service": "m1", "cost": 6, "expect": {"allowed": true, "mode": "own", "service_tokens": 0}}
+      ]
+    },
+    {
+      "name": "cooldown-blocks-everyone",
+      "spec": {"rate": 100, "burst": 10, "services": {"m1": {"rate": 60, "burst": 6}, "m2": {"rate": 40, "burst": 4}}},
+      "steps": [
+        {"op": "cooldown", "ms": 300},
+        {"op": "acquire", "service": "m1", "expect": {"allowed": false, "mode": "cooldown", "min_retry_after_ms": 1, "max_retry_after_ms": 300}},
+        {"op": "acquire", "service": "m2", "expect": {"allowed": false, "mode": "cooldown"}},
+        {"op": "sleep", "ms": 400},
+        {"op": "acquire", "service": "m2", "expect": {"allowed": true}}
+      ]
+    },
+    {
+      "name": "sync-remaining-only-lowers",
+      "spec": {"rate": 1, "burst": 100, "services": {"m1": {"rate": 1, "burst": 100}}},
+      "steps": [
+        {"op": "sync", "remaining": 5},
+        {"op": "drain", "service": "m1", "expect_count": 5, "expect_last_mode": "global"},
+        {"op": "sync", "remaining": 50},
+        {"op": "acquire", "service": "m1", "expect": {"allowed": false}}
+      ]
+    },
+    {
+      "name": "blocking-acquire-waits-for-refill",
+      "spec": {"rate": 20, "burst": 2, "services": {"m1": {"rate": 20, "burst": 2}}},
+      "steps": [
+        {"op": "drain", "service": "m1", "expect_count": 2, "expect_last_mode": "global"},
+        {"op": "acquire", "service": "m1", "wait_ms": 1000, "expect": {"allowed": true, "min_waited_ms": 20}},
+        {"op": "acquire", "service": "m1", "wait_ms": 1, "expect": {"allowed": false}}
+      ]
+    },
+    {
+      "name": "reset-refills",
+      "spec": {"rate": 1, "burst": 10, "services": {"m1": {"rate": 1, "burst": 10}}},
+      "steps": [
+        {"op": "drain", "service": "m1", "expect_count": 10},
+        {"op": "reset"},
+        {"op": "drain", "service": "m1", "expect_count": 10}
+      ]
+    },
+    {
+      "name": "unknown-service",
+      "spec": {"rate": 1, "burst": 10, "services": {"m1": {"rate": 1, "burst": 10}}},
+      "steps": [
+        {"op": "acquire_error", "service": "ghost"}
+      ]
+    }
+  ]
+}

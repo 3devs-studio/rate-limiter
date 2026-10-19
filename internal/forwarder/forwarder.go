@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"ratelimiter/internal/store"
+	"github.com/3devs-studio/rate-limiter/internal/store"
 )
 
 // Outcome is what the upstream answered.

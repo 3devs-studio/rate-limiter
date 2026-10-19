@@ -12,7 +12,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"ratelimiter/internal/limiter"
+	"github.com/3devs-studio/rate-limiter/internal/limiter"
 )
 
 // Config is the top-level configuration file.

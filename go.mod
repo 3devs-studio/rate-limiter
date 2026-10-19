@@ -1,4 +1,4 @@
-module ratelimiter
+module github.com/3devs-studio/rate-limiter
 
 go 1.26.0
 

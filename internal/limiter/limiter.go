@@ -10,8 +10,10 @@ package limiter
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -29,6 +31,12 @@ var syncSrc string
 
 // ErrUnknownService is returned for a service name that is not configured.
 var ErrUnknownService = errors.New("unknown service")
+
+// ErrNoConfig is returned by LoadSpec when nothing has been published for an upstream.
+var ErrNoConfig = errors.New("no published config for upstream")
+
+// ConfigSchema is the version of the published config document.
+const ConfigSchema = 1
 
 // Service is one caller's guaranteed share of an upstream.
 type Service struct {
@@ -58,6 +66,43 @@ func (u *Upstream) Service(name string) (Service, bool) {
 // Keys share a hash tag so they land on one slot in Redis Cluster.
 func (u *Upstream) globalKey() string          { return "rl:{" + u.Name + "}:g" }
 func (u *Upstream) serviceKey(s string) string { return "rl:{" + u.Name + "}:s:" + s }
+
+// ConfigKey is where the resolved shares of an upstream are published for SDKs.
+func ConfigKey(upstream string) string { return "rl:{" + upstream + "}:config" }
+
+// PublishedService is one service's share as published to Redis.
+type PublishedService struct {
+	Weight float64 `json:"weight"`
+	Rate   float64 `json:"rate"`
+	Burst  float64 `json:"burst"`
+}
+
+// Published is the config document SDKs read instead of carrying their own
+// copy of the YAML. Rates and bursts are already resolved from the weights.
+type Published struct {
+	Schema      int                         `json:"schema"`
+	Upstream    string                      `json:"upstream"`
+	Rate        float64                     `json:"rate"`
+	Burst       float64                     `json:"burst"`
+	Services    map[string]PublishedService `json:"services"`
+	PublishedAt time.Time                   `json:"published_at"`
+	PublishedBy string                      `json:"published_by"`
+}
+
+// Spec converts a published document back into an Upstream, services sorted by name.
+func (p *Published) Spec() *Upstream {
+	names := make([]string, 0, len(p.Services))
+	for n := range p.Services {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	up := &Upstream{Name: p.Upstream, Rate: p.Rate, Burst: p.Burst}
+	for _, n := range names {
+		s := p.Services[n]
+		up.Services = append(up.Services, Service{Name: n, Rate: s.Rate, Burst: s.Burst})
+	}
+	return up
+}
 
 // Decision is the outcome of an Acquire call.
 type Decision struct {
@@ -150,6 +195,59 @@ func (l *Limiter) Cooldown(ctx context.Context, up *Upstream, d time.Duration) e
 // still accept (for example from an X-RateLimit-Remaining header).
 func (l *Limiter) SyncRemaining(ctx context.Context, up *Upstream, remaining float64) error {
 	return l.sync.Run(ctx, l.rdb, []string{up.globalKey()}, remaining, up.Rate, up.Burst).Err()
+}
+
+// Publish writes the upstream's resolved shares to Redis for SDKs to read.
+// weights is optional and only recorded for display.
+func (l *Limiter) Publish(ctx context.Context, up *Upstream, weights map[string]float64, by string) error {
+	doc := Published{
+		Schema:      ConfigSchema,
+		Upstream:    up.Name,
+		Rate:        up.Rate,
+		Burst:       up.Burst,
+		Services:    make(map[string]PublishedService, len(up.Services)),
+		PublishedAt: time.Now().UTC(),
+		PublishedBy: by,
+	}
+	for _, s := range up.Services {
+		doc.Services[s.Name] = PublishedService{Weight: weights[s.Name], Rate: s.Rate, Burst: s.Burst}
+	}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	return l.rdb.Set(ctx, ConfigKey(up.Name), b, 0).Err()
+}
+
+// LoadSpec reads the published config of an upstream.
+func (l *Limiter) LoadSpec(ctx context.Context, upstream string) (*Upstream, *Published, error) {
+	b, err := l.rdb.Get(ctx, ConfigKey(upstream)).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, nil, fmt.Errorf("%w: %q", ErrNoConfig, upstream)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	var doc Published
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return nil, nil, fmt.Errorf("published config for %q: %w", upstream, err)
+	}
+	if doc.Schema != ConfigSchema {
+		return nil, nil, fmt.Errorf("published config for %q has schema %d, this build understands %d", upstream, doc.Schema, ConfigSchema)
+	}
+	if doc.Upstream == "" {
+		doc.Upstream = upstream
+	}
+	return doc.Spec(), &doc, nil
+}
+
+// Reset deletes every bucket of the upstream, so all of them read as full.
+func (l *Limiter) Reset(ctx context.Context, up *Upstream) error {
+	keys := []string{up.globalKey()}
+	for _, s := range up.Services {
+		keys = append(keys, up.serviceKey(s.Name))
+	}
+	return l.rdb.Del(ctx, keys...).Err()
 }
 
 // Snapshot reads the current bucket levels without modifying them.

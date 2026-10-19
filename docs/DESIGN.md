@@ -95,7 +95,7 @@ Two ways to use it:
 | Mode | Who calls the third party | When to use |
 |---|---|---|
 | **Proxy** (`/v1/proxy/...`) | The limiter forwards the request | Default. Gives queueing, replay and 429 absorption for free. |
-| **Acquire** (`/v1/acquire/...`) | The service, after being granted a token | When the request cannot be proxied (streaming, mutual TLS, SDK-generated calls). The service reports any 429 it sees via `/cooldown`. |
+| **Acquire** (`/v1/acquire/...`) | The service, after being granted a token | When the request cannot be proxied (streaming, mutual TLS, SDK-generated calls), or when the caller is itself a gateway that wants to admit or refuse its own clients (au1h does this per application, see the au1h `examples/rate-limit-demo`). With `wait`, the limiter holds the call until a token is free, so the caller still gets fair queueing. The service reports any 429 it sees via `/cooldown`. |
 
 ## 3. Components
 
@@ -435,9 +435,10 @@ erDiagram
 |---|---|---|---|
 | `ANY /v1/proxy/{upstream}/{path}` | Forward to `base_url + path` with the same method, query, headers and body | Upstream status and body, plus `X-RateLimiter-*` headers. `202` with `Location` if still queued after `X-Wait` | `400` bad header, `403` unknown service, `413` body too large, `503` + `Retry-After` queue full, `502` upstream failed or kept rejecting, `504` expired in queue |
 | `GET /v1/requests/{id}` | Fetch the stored response of a queued request | Upstream status and body, or `202` while queued | `404` unknown or expired id |
-| `POST /v1/acquire/{upstream}` | Take tokens for a service that calls the upstream itself. Body `{"service":"m1","cost":1}` | `200 {"allowed":true,"mode":"own"}` | `429` with `Retry-After` and `retry_after_ms`, `403` unknown service |
+| `POST /v1/acquire/{upstream}` | Take tokens for a service that calls the upstream itself. Body `{"service":"m1","cost":1,"wait":"5s"}`. With `wait`, the call is held until a token is free or the wait elapses: the caller gets the queue without proxying its request through the limiter | `200 {"allowed":true,"mode":"own","waited_ms":0}` | `429` with `Retry-After` and `retry_after_ms`, `403` unknown service |
+| `POST /v1/upstreams/{upstream}/reset` | Refill every bucket (demos, tests) | `200` | |
 | `POST /v1/upstreams/{upstream}/cooldown` | Report a 429 seen directly. Body `{"retry_after_ms":1000}` | `200` | |
-| `GET /v1/upstreams/{upstream}/stats` | Bucket levels, cooldown remaining, queue depth per service | JSON | |
+| `GET /v1/upstreams/{upstream}/stats` | Bucket levels, cooldown remaining, queue depth and blocking acquires waiting per service | JSON | |
 | `GET /v1/upstreams` | List configured upstreams | JSON | |
 | `GET /healthz` | Liveness | `200` | |
 
@@ -523,7 +524,16 @@ flowchart LR
   `remaining_header` (if the third party provides one) keeps the bucket in
   step from then on. Adjust `rate` in the config for a permanent change.
 
-## 12. Verification
+## 12. SDKs
+
+The admission logic lives in the Lua scripts, so a package can run it against
+Redis without the service in the request path. `sdk/` holds Go, TypeScript,
+Python, Rust, Ruby, PHP, Java and Kotlin packages with one middleware each,
+all reading the shares the service publishes to `rl:{upstream}:config` and all
+tested against `sdk/conformance/cases.json`. Proxy mode (queue and replay)
+stays in the service. Details in [`sdk/README.md`](../sdk/README.md).
+
+## 13. Verification
 
 Unit tests run against an in-memory Redis (miniredis) with a controlled clock
 and cover the admission invariants directly:
